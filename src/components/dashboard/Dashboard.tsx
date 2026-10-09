@@ -74,7 +74,6 @@ export default function Dashboard() {
   const [data, setData] = useState<ProductsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [parsing, setParsing] = useState(false);
-  const [syncing, setSyncing] = useState(false);
   const [parseElapsed, setParseElapsed] = useState(0);
   const [demoing, setDemoing] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -167,49 +166,6 @@ export default function Dashboard() {
     } finally {
       if (parseTimer.current) clearInterval(parseTimer.current);
       setParsing(false);
-    }
-  };
-
-  const syncSeller = async () => {
-    const supplier = Math.max(0, Number(parseSupplier) || 0);
-    setSyncing(true);
-    setParseError(null);
-    try {
-      const send = async (token?: string) => {
-        const res = await fetch("/api/seller/sync", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ supplierId: supplier, token }),
-        });
-        return { res, json: await res.json() };
-      };
-      let { json } = await send();
-      if (json.needToken) {
-        const token = window.prompt(
-          "Вставь API-ключ Wildberries.\nКабинет → Настройки → Доступ к API.\nКатегории: Контент и Цены и скидки."
-        );
-        if (!token?.trim()) {
-          setSyncing(false);
-          return;
-        }
-        ({ json } = await send(token.trim()));
-      }
-      if (json.ok) {
-        pushToast("ok", json.message ?? `Товаров: ${json.products}`);
-        if (supplier > 0) {
-          setSupplierSel(String(supplier));
-          window.localStorage.setItem("spp-radar-supplier", String(supplier));
-          await load(String(supplier));
-        } else {
-          await load(supplierSel);
-        }
-      } else {
-        setParseError(json.message ?? "Выгрузка по API не удалась");
-      }
-    } catch {
-      setParseError("Не удалось связаться с сервером");
-    } finally {
-      setSyncing(false);
     }
   };
 
@@ -367,18 +323,6 @@ export default function Dashboard() {
             <span className="relative flex items-center gap-2">
               {parsing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
               {parsing ? `Парсим… ${parseElapsed}с` : "Парсить цены"}
-            </span>
-          </button>
-
-          <button
-            onClick={syncSeller}
-            disabled={syncing}
-            className="glass rounded-xl px-3.5 py-2.5 text-sm font-medium text-zinc-200 transition hover:border-emerald-400/30 disabled:opacity-60"
-            title="Загрузить свои карточки и цены из кабинета через официальный API"
-          >
-            <span className="flex items-center gap-2">
-              {syncing ? <Loader2 className="h-4 w-4 animate-spin text-emerald-300" /> : <Database className="h-4 w-4 text-emerald-300" />}
-              {syncing ? "Грузим API…" : "Мои товары"}
             </span>
           </button>
 

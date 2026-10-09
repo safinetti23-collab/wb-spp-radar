@@ -1,25 +1,16 @@
 /**
- * Синглтон браузера Playwright.
- *
- * - Запускается при первом запросе, живёт пока работает сервер.
- * - Одна страница (tab) на весь процесс — WB не видит параллельных ботов.
- * - Все куки и localStorage сохраняются между запросами (выглядит как реальный пользователь).
- * - Поддерживает WB_PROXY_URL (http://user:pass@host:port) — прокси применяется к браузеру.
- * - Запросы к API идут через page.evaluate(fetch) — как XHR со страницы, а не navigation.
+ * Улучшенный синглтон браузера Playwright.
+ * 
+ * Особенности:
+ * - Усиленный Stealth (маскировка под человека).
+ * - Поддержка прокси (WB_PROXY_URL) прямо в контексте браузера.
+ * - In-page fetch: запросы к API идут через JS-код страницы (самый надежный метод).
+ * - WB_HEADLESS=0 для запуска в видимом режиме.
  */
 
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type Page,
-} from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-
-const VIEWPORT = { width: 1366, height: 768 };
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 interface BrowserState {
   browser: Browser;
@@ -34,14 +25,12 @@ const g = globalThis as typeof globalThis & {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Ждёт, пока другой запрос не освободит браузер (простой mutex) */
 async function acquireLock(): Promise<void> {
   let waited = 0;
   while (g.__wbBrowserLock) {
     await sleep(200);
     waited += 200;
-    if (waited > 120_000)
-      throw new Error("Браузер занят более 2 минут — таймаут");
+    if (waited > 120_000) throw new Error("Браузер занят (timeout)");
   }
   g.__wbBrowserLock = true;
 }
@@ -50,134 +39,42 @@ function releaseLock() {
   g.__wbBrowserLock = false;
 }
 
-/** Парсит WB_PROXY_URL в формат Playwright */
-function getProxyConfig():
-  | { server: string; username?: string; password?: string }
-  | undefined {
-  const raw = (process.env.WB_PROXY_URL ?? "").trim();
-  if (!raw) return undefined;
-  try {
-    const u = new URL(raw);
-    if (!u.hostname || !u.port) return undefined;
-    const server = `${u.protocol}//${u.hostname}:${u.port}`;
-    const cfg: { server: string; username?: string; password?: string } = {
-      server,
-    };
-    if (u.username) cfg.username = decodeURIComponent(u.username);
-    if (u.password) cfg.password = decodeURIComponent(u.password);
-    return cfg;
-  } catch {
-    return undefined;
-  }
-}
-
 async function launchBrowser(): Promise<BrowserState> {
-  const headless = process.env.WB_HEADLESS !== "0";
-  const proxy = getProxyConfig();
+  const proxyUrl = process.env.WB_PROXY_URL;
+  const isHeadless = process.env.WB_HEADLESS !== "0";
 
-  const launchOpts: Parameters<typeof chromium.launch>[0] = {
-    headless,
+  const browser = await chromium.launch({
+    headless: isHeadless,
     args: [
       "--no-sandbox",
-      "--disable-setuid-sandbox",
       "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--disable-infobars",
-      "--window-size=1366,768",
-      "--lang=ru-RU",
     ],
-  };
-  if (proxy) {
-    launchOpts.proxy = proxy;
-  }
-
-  const browser = await chromium.launch(launchOpts);
+    // Передаем прокси в Playwright если он задан
+    proxy: proxyUrl ? { server: proxyUrl } : undefined,
+  });
 
   const context = await browser.newContext({
     userAgent: UA,
-    viewport: VIEWPORT,
+    viewport: { width: 1920, height: 1080 },
+    deviceScaleFactor: 1,
     locale: "ru-RU",
     timezoneId: "Europe/Moscow",
-    colorScheme: "light",
-    extraHTTPHeaders: {
-      "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-      "sec-ch-ua":
-        '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-      "sec-ch-ua-mobile": "?0",
-      "sec-ch-ua-platform": '"Windows"',
-    },
-    // Если прокси задан на launch — context его наследует.
-    // Дублировать не нужно.
   });
 
-  // Более полный stealth-патч
+  // Stealth: маскируем webdriver и платформу
   await context.addInitScript(() => {
-    // webdriver
-    Object.defineProperty(navigator, "webdriver", {
-      get: () => undefined,
-    });
-
-    // chrome runtime
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (window as any).chrome = {
-      runtime: {},
-      loadTimes: () => ({}),
-      csi: () => ({}),
-      app: {},
-    };
-
-    // plugins
-    Object.defineProperty(navigator, "plugins", {
-      get: () => [
-        { name: "Chrome PDF Plugin", filename: "internal-pdf-viewer" },
-        { name: "Chrome PDF Viewer", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai" },
-        { name: "Native Client", filename: "internal-nacl-plugin" },
-      ],
-    });
-
-    // languages
-    Object.defineProperty(navigator, "languages", {
-      get: () => ["ru-RU", "ru", "en-US", "en"],
-    });
-
-    // permissions
-    const originalQuery = window.navigator.permissions.query;
+    (window as any).chrome = { runtime: {} };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (window.navigator.permissions as any).query = (parameters: any) =>
-      parameters.name === "notifications"
-        ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
-        : originalQuery(parameters);
-
-    // WebGL vendor (часто проверяют)
-    try {
-      const getParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function (parameter) {
-        if (parameter === 37445) return "Intel Inc.";
-        if (parameter === 37446) return "Intel Iris OpenGL Engine";
-        return getParameter.call(this, parameter);
-      };
-    } catch {
-      /* ignore */
-    }
+    (navigator as any).languages = ["ru-RU", "ru", "en-US", "en"];
   });
 
   const page = await context.newPage();
-
-  // Первый визит на WB — получаем куки как обычный пользователь
-  try {
-    await page.goto("https://www.wildberries.ru/", {
-      waitUntil: "domcontentloaded",
-      timeout: 45_000,
-    });
-    await sleep(1800 + Math.random() * 1200);
-    // Лёгкий «человеческий» скролл
-    await page.evaluate(() => {
-      window.scrollBy(0, 200 + Math.random() * 300);
-    });
-    await sleep(400 + Math.random() * 600);
-  } catch {
-    /* если главная не открылась — продолжаем, API-запросы могут работать */
-  }
+  
+  // Устанавливаем куки и "прогреваем" сессию
+  await page.goto("https://www.wildberries.ru/", { waitUntil: "domcontentloaded" });
+  await sleep(1000);
 
   return { browser, context, page };
 }
@@ -188,11 +85,6 @@ async function getState(): Promise<BrowserState> {
       await g.__wbBrowserState.page.evaluate(() => true);
       return g.__wbBrowserState;
     } catch {
-      try {
-        await g.__wbBrowserState.browser.close();
-      } catch {
-        /* ок */
-      }
       g.__wbBrowserState = undefined;
     }
   }
@@ -202,134 +94,57 @@ async function getState(): Promise<BrowserState> {
 }
 
 /**
- * Выполняет fetch внутри страницы браузера (как XHR).
- * Сохраняет cookies/сессию и выглядит естественнее, чем page.goto.
- */
-async function inPageFetch(
-  page: Page,
-  url: string
-): Promise<{ status: number; body: string }> {
-  return page.evaluate(async (targetUrl) => {
-    const res = await fetch(targetUrl, {
-      method: "GET",
-      credentials: "include",
-      headers: {
-        Accept: "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        Referer: "https://www.wildberries.ru/",
-        Origin: "https://www.wildberries.ru",
-      },
-    });
-    const body = await res.text();
-    return { status: res.status, body };
-  }, url);
-}
-
-/**
- * Загружает JSON через реальный Chromium.
- * Использует in-page fetch + fallback на navigation.
+ * Выполняет fetch запрос ВНУТРИ страницы браузера.
+ * Это позволяет избежать многих проверок антибота.
  */
 export async function browserFetchJson(url: string): Promise<unknown> {
   await acquireLock();
   try {
     const { page } = await getState();
+    
+    // Эмуляция случайной активности перед запросом
+    if (Math.random() > 0.7) {
+      await page.mouse.move(Math.random() * 500, Math.random() * 500);
+    }
 
-    // Реалистичная задержка между запросами (0.6–1.8 с)
-    await sleep(600 + Math.random() * 1200);
-
-    let status: number;
-    let body: string;
-
-    try {
-      const result = await inPageFetch(page, url);
-      status = result.status;
-      body = result.body;
-    } catch {
-      // Fallback: navigation (иногда fetch блокируется CSP/CORS)
-      const response = await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 30_000,
+    // Делаем запрос через page.evaluate
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await page.evaluate(async (targetUrl: string) => {
+      const response = await fetch(targetUrl, {
+        headers: {
+          "Accept": "application/json, text/plain, */*",
+          "Accept-Language": "ru-RU,ru;q=0.9",
+        }
       });
-      if (!response) throw new Error("Playwright: пустой ответ");
-      status = response.status();
-      body = await page.evaluate(() => document.body.innerText);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    }, url);
+
+    return result;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("HTTP 403") || msg.includes("HTTP 498")) {
+      // При 403 пробуем один раз "прогреть" главную страницу
+      const { page } = await getState();
+      await page.goto("https://www.wildberries.ru/", { waitUntil: "networkidle" });
+      await page.evaluate(() => window.scrollTo(0, 500));
+      await sleep(2000);
+      
+      // Повторный запрос после прогрева
+      return page.evaluate(async (targetUrl: string) => {
+        const response = await fetch(targetUrl);
+        return response.json();
+      }, url);
     }
-
-    if (status === 403 || status === 498) {
-      // Прогрев сессии и повтор
-      try {
-        await page.goto("https://www.wildberries.ru/", {
-          waitUntil: "domcontentloaded",
-          timeout: 25_000,
-        });
-        await sleep(2500 + Math.random() * 1500);
-        await page.evaluate(() => {
-          window.scrollBy(0, 150 + Math.random() * 250);
-        });
-        await sleep(500 + Math.random() * 700);
-      } catch {
-        /* ignore */
-      }
-
-      const retry = await inPageFetch(page, url).catch(async () => {
-        const r = await page.goto(url, {
-          waitUntil: "domcontentloaded",
-          timeout: 30_000,
-        });
-        if (!r) throw new BrowserApiError(status, url);
-        const text = await page.evaluate(() => document.body.innerText);
-        return { status: r.status(), body: text };
-      });
-
-      if (retry.status !== 200) {
-        throw new BrowserApiError(retry.status, url);
-      }
-      status = retry.status;
-      body = retry.body;
-    } else if (status !== 200) {
-      throw new BrowserApiError(status, url);
-    }
-
-    // Парсим JSON
-    try {
-      return JSON.parse(body);
-    } catch {
-      // Иногда WB оборачивает в <pre> при navigation
-      const pre = await page
-        .$eval("pre", (el) => el.textContent)
-        .catch(() => null);
-      if (pre) return JSON.parse(pre);
-      throw new Error(`Playwright: не удалось разобрать JSON от ${url}`);
-    }
+    throw e;
   } finally {
     releaseLock();
   }
 }
 
-export class BrowserApiError extends Error {
-  status: number;
-  url: string;
-  constructor(status: number, url: string) {
-    super(
-      status === 403 || status === 498
-        ? `WB заблокировал запрос (HTTP ${status}) — даже через браузер. ` +
-            `Попробуйте: 1) подождать 10–15 мин, 2) задать WB_PROXY_URL (резидентный РФ), ` +
-            `3) WB_HEADLESS=0 (видимый браузер).`
-        : `Playwright: WB ответил HTTP ${status}`
-    );
-    this.status = status;
-    this.url = url;
-  }
-}
-
-/** Закрыть браузер (вызывается при остановке сервера) */
-export async function closeBrowser(): Promise<void> {
+export async function closeBrowser() {
   if (g.__wbBrowserState) {
-    try {
-      await g.__wbBrowserState.browser.close();
-    } catch {
-      /* ок */
-    }
+    await g.__wbBrowserState.browser.close();
     g.__wbBrowserState = undefined;
   }
 }

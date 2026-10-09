@@ -4,10 +4,8 @@
  * Режимы работы (выбирается автоматически по наличию env-переменных):
  *
  * 1. BROWSER (по умолчанию, WB_USE_FETCH не задан)
- *    Реальный Chromium через Playwright.
- *    Поддерживает WB_PROXY_URL — прокси применяется к браузеру.
- *    Запросы идут через in-page fetch (как XHR), с stealth-патчами.
- *    WB_HEADLESS=0 — запуск видимого окна (иногда лучше проходит антибот).
+ *    Реальный Chromium через Playwright. Работает с домашнего IP без прокси.
+ *    Браузер запускается один раз, живёт пока работает сервер.
  *
  * 2. FETCH + PROXY (WB_USE_FETCH=1 + WB_PROXY_URL задан)
  *    Обычный HTTP-запрос через прокси (http://user:pass@host:port).
@@ -17,7 +15,7 @@
  *    Только для локальной сети, где IP не заблокирован.
  */
 
-import { browserFetchJson, BrowserApiError } from "@/lib/browser";
+import { browserFetchJson } from "@/lib/browser";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 export const DEFAULT_DEST = -1257786; // Московский регион
@@ -63,9 +61,8 @@ export class WbApiError extends Error {
     super(
       status === 403 || status === 498
         ? `WB заблокировал запрос (HTTP ${status}). ` +
-          `Варианты: 1) WB_PROXY_URL=http://user:pass@host:port (резидентный РФ) — ` +
-          `работает и в Playwright, и в fetch; 2) подождать 10–15 мин; ` +
-          `3) WB_HEADLESS=0 (видимый браузер); 4) npx playwright install chromium.`
+          `Убедитесь, что Playwright установлен (npx playwright install chromium) ` +
+          `или задайте WB_USE_FETCH=1 + WB_PROXY_URL.`
         : `WB API ответил HTTP ${status}`
     );
     this.status = status;
@@ -150,9 +147,9 @@ async function fetchJson(url: string): Promise<unknown> {
   try {
     return await browserFetchJson(url);
   } catch (e) {
-    if (e instanceof BrowserApiError) {
-      throw new WbApiError(e.status, url);
-    }
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("HTTP 403")) throw new WbApiError(403, url);
+    if (msg.includes("HTTP 498")) throw new WbApiError(498, url);
     throw e;
   }
 }
