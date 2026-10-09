@@ -134,12 +134,20 @@ export async function browserFetchJson(url: string): Promise<unknown> {
     // Если fetch внутри страницы не сработал (пусто или HTML) — пробуем обычный goto
     if (msg.includes("EMPTY_RESPONSE") || msg.includes("HTML_INSTEAD_OF_JSON") || msg.includes("INVALID_JSON")) {
       const { page } = await getState();
-      await page.goto(url, { waitUntil: "domcontentloaded" });
+      await page.goto(url, { 
+        waitUntil: "domcontentloaded",
+        timeout: 25000 
+      });
+      // Ждем немного, чтобы JS отработал
+      await sleep(1000);
       const bodyText = await page.evaluate(() => document.body.innerText);
       try {
         return JSON.parse(bodyText);
       } catch {
-        throw new Error(`WB_BLOCK: Сервер прислал не данные, а заглушку (вероятно капча). Попробуйте WB_HEADLESS=0`);
+        // Если внутри HTML, попробуем вытащить JSON из тега pre
+        const preText = await page.$eval("pre", el => el.textContent).catch(() => null);
+        if (preText) return JSON.parse(preText);
+        throw new Error(`WB_BLOCK: Сервер прислал не данные, а заглушку. Возможно, нужно решить капчу в открывшемся окне.`);
       }
     }
 
