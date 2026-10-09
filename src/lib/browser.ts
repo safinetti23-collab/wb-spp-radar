@@ -107,7 +107,7 @@ export async function browserFetchJson(url: string): Promise<unknown> {
       await page.mouse.move(Math.random() * 500, Math.random() * 500);
     }
 
-    // Делаем запрос через page.evaluate
+    // Делаем запрос через page.evaluate с проверкой контента
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = await page.evaluate(async (targetUrl: string) => {
       const response = await fetch(targetUrl, {
@@ -117,12 +117,32 @@ export async function browserFetchJson(url: string): Promise<unknown> {
         }
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return response.json();
+      const text = await response.text();
+      if (!text || text.trim() === "") throw new Error("EMPTY_RESPONSE");
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        if (text.includes("<html") || text.includes("<body")) throw new Error("HTML_INSTEAD_OF_JSON");
+        throw new Error(`INVALID_JSON: ${text.slice(0, 50)}`);
+      }
     }, url);
 
     return result;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+
+    // Если fetch внутри страницы не сработал (пусто или HTML) — пробуем обычный goto
+    if (msg.includes("EMPTY_RESPONSE") || msg.includes("HTML_INSTEAD_OF_JSON") || msg.includes("INVALID_JSON")) {
+      const { page } = await getState();
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+      const bodyText = await page.evaluate(() => document.body.innerText);
+      try {
+        return JSON.parse(bodyText);
+      } catch {
+        throw new Error(`WB_BLOCK: Сервер прислал не данные, а заглушку (вероятно капча). Попробуйте WB_HEADLESS=0`);
+      }
+    }
+
     if (msg.includes("HTTP 403") || msg.includes("HTTP 498")) {
       // При 403 пробуем один раз "прогреть" главную страницу
       const { page } = await getState();
