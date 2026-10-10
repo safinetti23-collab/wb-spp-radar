@@ -1,11 +1,9 @@
 /**
- * Улучшенный синглтон браузера Playwright.
+ * Максимально "человечный" браузерный клиент.
  * 
- * Особенности:
- * - Усиленный Stealth (маскировка под человека).
- * - Поддержка прокси (WB_PROXY_URL) прямо в контексте браузера.
- * - In-page fetch: запросы к API идут через JS-код страницы (самый надежный метод).
- * - WB_HEADLESS=0 для запуска в видимом режиме.
+ * Если обычный fetch не проходит, он буквально переходит по ссылке
+ * и ждет появления данных на экране. Это позволяет пользователю
+ * самому решить капчу, если она появится.
  */
 
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
@@ -24,6 +22,7 @@ const g = globalThis as typeof globalThis & {
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const MANUAL_WAIT_MS = Number(process.env.WB_MANUAL_WAIT_MS ?? 0) || 0;
 
 async function acquireLock(): Promise<void> {
   let waited = 0;
@@ -39,43 +38,54 @@ function releaseLock() {
   g.__wbBrowserLock = false;
 }
 
+async function acceptCookies(page: Page): Promise<boolean> {
+  try {
+    const cookieBtn = await page.locator("button:has-text('Окей'), button:has-text('OK'), .cookie-banner__btn").first();
+    if (await cookieBtn.isVisible({ timeout: 2000 })) {
+      await cookieBtn.click();
+      return true;
+    }
+  } catch { /* ок */ }
+  return false;
+}
+
+async function warmMainPage(page: Page): Promise<void> {
+  await page.goto("https://www.wildberries.ru/", { waitUntil: "domcontentloaded", timeout: 30000 });
+  await sleep(1000);
+  await acceptCookies(page);
+  if (MANUAL_WAIT_MS > 0) await sleep(MANUAL_WAIT_MS);
+}
+
 async function launchBrowser(): Promise<BrowserState> {
-  const proxyUrl = process.env.WB_PROXY_URL;
+  const proxyUrl = (process.env.WB_PROXY_URL ?? "").trim();
   const isHeadless = process.env.WB_HEADLESS !== "0";
+
+  let proxyConfig;
+  if (proxyUrl) {
+    try {
+      const p = new URL(proxyUrl);
+      proxyConfig = {
+        server: `${p.protocol}//${p.hostname}:${p.port}`,
+        username: decodeURIComponent(p.username),
+        password: decodeURIComponent(p.password),
+      };
+    } catch { proxyConfig = { server: proxyUrl }; }
+  }
 
   const browser = await chromium.launch({
     headless: isHeadless,
-    args: [
-      "--no-sandbox",
-      "--disable-blink-features=AutomationControlled",
-    ],
-    // Передаем прокси в Playwright если он задан
-    proxy: proxyUrl ? { server: proxyUrl } : undefined,
+    args: ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+    proxy: proxyConfig,
   });
 
   const context = await browser.newContext({
     userAgent: UA,
-    viewport: { width: 1920, height: 1080 },
-    deviceScaleFactor: 1,
+    viewport: { width: 1280, height: 800 },
     locale: "ru-RU",
-    timezoneId: "Europe/Moscow",
-  });
-
-  // Stealth: маскируем webdriver и платформу
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (window as any).chrome = { runtime: {} };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (navigator as any).languages = ["ru-RU", "ru", "en-US", "en"];
   });
 
   const page = await context.newPage();
-  
-  // Устанавливаем куки и "прогреваем" сессию
-  await page.goto("https://www.wildberries.ru/", { waitUntil: "domcontentloaded" });
-  await sleep(1000);
-
+  await warmMainPage(page).catch(() => {});
   return { browser, context, page };
 }
 
@@ -84,9 +94,7 @@ async function getState(): Promise<BrowserState> {
     try {
       await g.__wbBrowserState.page.evaluate(() => true);
       return g.__wbBrowserState;
-    } catch {
-      g.__wbBrowserState = undefined;
-    }
+    } catch { g.__wbBrowserState = undefined; }
   }
   const state = await launchBrowser();
   g.__wbBrowserState = state;
@@ -94,77 +102,50 @@ async function getState(): Promise<BrowserState> {
 }
 
 /**
- * Выполняет fetch запрос ВНУТРИ страницы браузера.
- * Это позволяет избежать многих проверок антибота.
+ * Главная функция получения данных.
+ * Пробует fetch, а если 403 - переходит по ссылке.
  */
 export async function browserFetchJson(url: string): Promise<unknown> {
   await acquireLock();
   try {
     const { page } = await getState();
-    
-    // Эмуляция случайной активности перед запросом
-    if (Math.random() > 0.7) {
-      await page.mouse.move(Math.random() * 500, Math.random() * 500);
-    }
 
-    // Делаем запрос через page.evaluate с проверкой контента
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const result = await page.evaluate(async (targetUrl: string) => {
-      const response = await fetch(targetUrl, {
-        headers: {
-          "Accept": "application/json, text/plain, */*",
-          "Accept-Language": "ru-RU,ru;q=0.9",
-        }
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const text = await response.text();
-      if (!text || text.trim() === "") throw new Error("EMPTY_RESPONSE");
-      try {
-        return JSON.parse(text);
-      } catch (e) {
-        if (text.includes("<html") || text.includes("<body")) throw new Error("HTML_INSTEAD_OF_JSON");
-        throw new Error(`INVALID_JSON: ${text.slice(0, 50)}`);
-      }
-    }, url);
-
-    return result;
-  } catch (e: any) {
-    const msg = e?.message || String(e);
-
-    // Если fetch внутри страницы не сработал (пусто или HTML) — пробуем обычный goto
-    if (msg.includes("EMPTY_RESPONSE") || msg.includes("HTML_INSTEAD_OF_JSON") || msg.includes("INVALID_JSON")) {
-      const { page } = await getState();
-      await page.goto(url, { 
-        waitUntil: "domcontentloaded",
-        timeout: 25000 
-      });
-      // Ждем немного, чтобы JS отработал
-      await sleep(1000);
-      const bodyText = await page.evaluate(() => document.body.innerText);
-      try {
-        return JSON.parse(bodyText);
-      } catch {
-        // Если внутри HTML, попробуем вытащить JSON из тега pre
-        const preText = await page.$eval("pre", el => el.textContent).catch(() => null);
-        if (preText) return JSON.parse(preText);
-        throw new Error(`WB_BLOCK: Сервер прислал не данные, а заглушку. Возможно, нужно решить капчу в открывшемся окне.`);
-      }
-    }
-
-    if (msg.includes("HTTP 403") || msg.includes("HTTP 498")) {
-      // При 403 пробуем один раз "прогреть" главную страницу
-      const { page } = await getState();
-      await page.goto("https://www.wildberries.ru/", { waitUntil: "networkidle" });
-      await page.evaluate(() => window.scrollTo(0, 500));
-      await sleep(2000);
-      
-      // Повторный запрос после прогрева
-      return page.evaluate(async (targetUrl: string) => {
-        const response = await fetch(targetUrl);
-        return response.json();
+    // Метод 1: In-page fetch (быстро)
+    try {
+      const res = await page.evaluate(async (targetUrl) => {
+        const r = await fetch(targetUrl);
+        if (!r.ok) return { error: r.status, text: await r.text() };
+        return { data: await r.json() };
       }, url);
+
+      if ((res as any).data) return (res as any).data;
+      // Если получили 403 - не падаем, идем к Методу 2
+    } catch { /* ошибка парсинга или сети - идем к Методу 2 */ }
+
+    // Метод 2: Навигация (надежно)
+    // Буквально открываем URL в браузере
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 });
+    
+    // Ждем, пока на странице появится JSON (или пока пользователь решит капчу)
+    let attempts = 0;
+    while (attempts < 10) {
+      const content = await page.evaluate(() => document.body.innerText);
+      if (content.trim().startsWith("{") || content.trim().startsWith("[")) {
+        try {
+          return JSON.parse(content);
+        } catch { /* ждем дальше */ }
+      }
+      
+      // Если видим признаки 403 или капчи - ждем дольше
+      if (content.includes("403") || content.includes("robot") || content.includes("капч")) {
+        await sleep(2000);
+      } else {
+        await sleep(1000);
+      }
+      attempts++;
     }
-    throw e;
+
+    throw new Error("Не удалось получить JSON даже после навигации. Проверьте окно браузера.");
   } finally {
     releaseLock();
   }
